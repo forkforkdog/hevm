@@ -1321,6 +1321,11 @@ executePrecompile preCompileAddr gasCap inOffset inSize outOffset outSize xs  = 
                 next
               Nothing -> precompileFail
             _ -> precompileFail
+           --NOTE: added by fuzzer 
+      0xA -> do
+        assign (#state % #stack) (Lit 1 : xs)
+        assign (#state % #returndata) mempty
+        next
 
       _ -> notImplemented
 
@@ -2871,6 +2876,7 @@ costOfPrecompile (FeeSchedule {..}) precompileAddr input =
     0x9 -> case input of
              ConcreteBuf i -> g_fround * (unsafeInto $ asInteger $ lazySlice 0 4 i)
              _ -> internalError "Unsupported symbolic blake2 gas calc"
+    0xA -> 3000
     _ -> internalError $ "unimplemented precompiled contract " ++ show precompileAddr
 
 -- Gas cost of memory expansion
