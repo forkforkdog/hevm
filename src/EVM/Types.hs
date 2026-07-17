@@ -44,6 +44,7 @@ import Data.Map (Map)
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Sequence (Seq)
+import Data.Text (Text)
 import Data.Sequence qualified as Seq
 import Data.Serialize qualified as Cereal
 import Data.Text qualified as T
@@ -607,6 +608,18 @@ data Effect t where
 deriving instance Show (Effect t)
 
 -- | Queries halt execution until resolved through RPC calls or SMT queries
+data RvmLayoutRef
+  = RvmInline Text
+  | RvmContract Text
+  | RvmNamespace Text Text
+  | RvmNamespaceAt W256 Text
+  deriving (Show, Eq, Ord)
+
+-- | A storage location resolved by the Echidna host. Offsets and sizes are in
+-- bytes, counted from the least-significant byte of the slot.
+data RvmResolvedSlot = RvmResolvedSlot W256 Int Int
+  deriving (Show, Eq, Ord)
+
 data Query t where
   PleaseFetchContract :: Addr -> BaseState -> (Contract -> EVM t ()) -> Query t
   PleaseFetchSlot     :: Addr -> W256 -> (W256 -> EVM t ()) -> Query t
@@ -615,6 +628,8 @@ data Query t where
   PleaseDoFFI         :: [String] -> Map String String -> (ByteString -> EVM t ()) -> Query t
   PleaseReadEnv       :: String -> (String -> EVM t ()) -> Query t
   PleaseGetCode       :: FilePath -> (Either String ByteString -> EVM t ()) -> Query t
+  PleaseResolveStorage :: Addr -> Text -> ByteString -> [RvmLayoutRef]
+                       -> (Either Text RvmResolvedSlot -> EVM t ()) -> Query t
 
 data BranchContext where
   PleaseRunBoth :: (Bool -> EVM Symbolic ()) -> BranchContext
@@ -648,6 +663,11 @@ instance Show (Query t) where
       (("<EVM.Query: read env: " ++ variable) ++)
     PleaseGetCode path _ ->
       (("<EVM.Query: get code: " ++ path ++ ">") ++)
+    PleaseResolveStorage addr path keys refs _ ->
+      (("<EVM.Query: resolve RVM storage path "
+        ++ show path ++ " for " ++ show addr
+        ++ " with " ++ show (BS.length keys) ++ " key bytes and refs "
+        ++ show refs ++ ">") ++)
 
 instance Show (BranchContext) where
   showsPrec _ = \case
@@ -775,6 +795,7 @@ data RuntimeConfig = RuntimeConfig
   { allowFFI :: Bool
   , baseState :: BaseState
   , traceEnabled :: Bool
+  , rvmLayoutRefs :: Map Addr [RvmLayoutRef]
   }
   deriving (Show)
 

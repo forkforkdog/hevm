@@ -716,6 +716,9 @@ oracle solvers preSess rpcInfo q = do
       res <- liftIO $ GetCode.getCodeFromEnv GetCode.PreferHevm artifactRef
       pure $ continue res
 
+    PleaseResolveStorage _ _ _ _ continue ->
+      pure $ continue $ Left "RVM storage layout resolution is unavailable in this HEVM host"
+
     where
       -- special values such as 0, 0xdeadbeef, 0xacab, hevm cheatcodes, and the precompile addresses
       isAddressSpecial addr = addr <= 0xdeadbeef || addr == 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D

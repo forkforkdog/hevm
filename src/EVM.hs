@@ -30,7 +30,7 @@ import EVM.Effects (Config (..))
 import Control.Monad (forM_, unless, when)
 import Control.Monad.ST (ST, RealWorld)
 import Control.Monad.State.Strict (MonadState, State, get, gets, lift, modify', put, execStateT)
-import Data.Bits (FiniteBits, countLeadingZeros, finiteBitSize, shiftR, (.&.))
+import Data.Bits (FiniteBits, complement, countLeadingZeros, finiteBitSize, shiftL, shiftR, (.&.))
 import Data.ByteArray qualified as BA
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -51,7 +51,8 @@ import Data.Maybe (fromMaybe, fromJust, isJust, isNothing, mapMaybe)
 import Data.Set (insert, member, fromList)
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
-import Data.Text (unpack, pack)
+import Data.Text (Text, unpack, pack)
+import Data.Text.Encoding (decodeUtf8')
 import Data.Tree
 import Data.Tree.Zipper qualified as Zipper
 import Data.Typeable
@@ -197,6 +198,7 @@ makeVm o = do
       { allowFFI = o.allowFFI
       , baseState = o.baseState
       , traceEnabled = True
+      , rvmLayoutRefs = mempty
       }
     , forks = Seq.singleton (ForkState env block mempty "")
     , currentFork = 0
@@ -2144,6 +2146,113 @@ cheatActions = Map.fromList
           _ -> vmError (BadCheatCode "load(address,bytes32) issue, maybe the address provided is not correct?" sig)
         _ -> vmError (BadCheatCode "load(address,bytes32) parameter decoding failed" sig)
 
+  , action "loadVar(address,string)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiStringType] input of
+        (CAbi [AbiAddress target, AbiString pathBytes], "") ->
+          case decodeUtf8' pathBytes of
+            Left _ -> rvmDecodeError sig "loadVar(address,string): path is not valid UTF-8"
+            Right path -> resolveRvmSlot sig target path mempty (rvmLoadResolved sig target)
+        _ -> rvmDecodeError sig "loadVar(address,string) parameter decoding failed"
+
+  , action "loadVar(address,string,bytes)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiStringType, AbiBytesDynamicType] input of
+        (CAbi [AbiAddress target, AbiString pathBytes, AbiBytesDynamic keys], "") ->
+          case decodeUtf8' pathBytes of
+            Left _ -> rvmDecodeError sig "loadVar(address,string,bytes): path is not valid UTF-8"
+            Right path -> resolveRvmSlot sig target path keys (rvmLoadResolved sig target)
+        _ -> rvmDecodeError sig "loadVar(address,string,bytes) parameter decoding failed"
+
+  , action "loadVar(address,bytes32,uint8,uint8)" $
+      \sig input -> case decodeBuf
+        [AbiAddressType, AbiBytesType 32, AbiUIntType 8, AbiUIntType 8] input of
+          (CAbi [ AbiAddress target
+                , AbiBytes 32 slotBytes
+                , AbiUInt 8 offset
+                , AbiUInt 8 size
+                ], "") ->
+            rvmLoadResolved sig target $
+              RvmResolvedSlot (word slotBytes) (fromIntegral offset) (fromIntegral size)
+          _ -> rvmDecodeError sig "loadVar(address,bytes32,uint8,uint8) parameter decoding failed"
+
+  , action "storeVar(address,string,bytes32)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiStringType, AbiBytesType 32] input of
+        (CAbi [AbiAddress target, AbiString pathBytes, AbiBytes 32 valueBytes], "") ->
+          case decodeUtf8' pathBytes of
+            Left _ -> rvmDecodeError sig "storeVar(address,string,bytes32): path is not valid UTF-8"
+            Right path -> resolveRvmSlot sig target path mempty $
+              \resolved -> rvmStoreResolved sig target resolved (Lit $ word valueBytes)
+        _ -> rvmDecodeError sig "storeVar(address,string,bytes32) parameter decoding failed"
+
+  , action "storeVar(address,string,bytes,bytes32)" $
+      \sig input -> case decodeBuf
+        [AbiAddressType, AbiStringType, AbiBytesDynamicType, AbiBytesType 32] input of
+          (CAbi [ AbiAddress target
+                , AbiString pathBytes
+                , AbiBytesDynamic keys
+                , AbiBytes 32 valueBytes
+                ], "") ->
+            case decodeUtf8' pathBytes of
+              Left _ -> rvmDecodeError sig "storeVar(address,string,bytes,bytes32): path is not valid UTF-8"
+              Right path -> resolveRvmSlot sig target path keys $
+                \resolved -> rvmStoreResolved sig target resolved (Lit $ word valueBytes)
+          _ -> rvmDecodeError sig "storeVar(address,string,bytes,bytes32) parameter decoding failed"
+
+  , action "storeVar(address,bytes32,uint8,uint8,bytes32)" $
+      \sig input -> case decodeBuf
+        [ AbiAddressType, AbiBytesType 32, AbiUIntType 8, AbiUIntType 8
+        , AbiBytesType 32
+        ] input of
+          (CAbi [ AbiAddress target
+                , AbiBytes 32 slotBytes
+                , AbiUInt 8 offset
+                , AbiUInt 8 size
+                , AbiBytes 32 valueBytes
+                ], "") ->
+            rvmStoreResolved sig target
+              (RvmResolvedSlot (word slotBytes) (fromIntegral offset) (fromIntegral size))
+              (Lit $ word valueBytes)
+          _ -> rvmDecodeError sig "storeVar(address,bytes32,uint8,uint8,bytes32) parameter decoding failed"
+
+  , action "registerStorageLayout(address,string)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiStringType] input of
+        (CAbi [AbiAddress target, AbiString layoutBytes], "") ->
+          case decodeUtf8' layoutBytes of
+            Left _ -> rvmDecodeError sig "registerStorageLayout(address,string): layout is not valid UTF-8"
+            Right layout -> do
+              modifying (#config % #rvmLayoutRefs) (Map.insert target [RvmInline layout])
+              doStop
+        _ -> rvmDecodeError sig "registerStorageLayout(address,string) parameter decoding failed"
+
+  , action "assignStorageLayout(address,string)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiStringType] input of
+        (CAbi [AbiAddress target, AbiString contractBytes], "") ->
+          case decodeUtf8' contractBytes of
+            Left _ -> rvmDecodeError sig "assignStorageLayout(address,string): contract name is not valid UTF-8"
+            Right contractName -> do
+              modifying (#config % #rvmLayoutRefs) (Map.insert target [RvmContract contractName])
+              doStop
+        _ -> rvmDecodeError sig "assignStorageLayout(address,string) parameter decoding failed"
+
+  , action "registerNamespace(address,string,string)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiStringType, AbiStringType] input of
+        (CAbi [AbiAddress target, AbiString namespaceBytes, AbiString layoutBytes], "") ->
+          case (decodeUtf8' namespaceBytes, decodeUtf8' layoutBytes) of
+            (Right namespace, Right layout) -> do
+              appendRvmLayoutRef target (RvmNamespace namespace layout)
+              doStop
+            _ -> rvmDecodeError sig "registerNamespace(address,string,string): namespace or layout is not valid UTF-8"
+        _ -> rvmDecodeError sig "registerNamespace(address,string,string) parameter decoding failed"
+
+  , action "registerNamespace(address,uint256,string)" $
+      \sig input -> case decodeBuf [AbiAddressType, AbiUIntType 256, AbiStringType] input of
+        (CAbi [AbiAddress target, AbiUInt 256 baseSlot, AbiString layoutBytes], "") ->
+          case decodeUtf8' layoutBytes of
+            Right layout -> do
+              appendRvmLayoutRef target (RvmNamespaceAt (into baseSlot) layout)
+              doStop
+            Left _ -> rvmDecodeError sig "registerNamespace(address,uint256,string): layout is not valid UTF-8"
+        _ -> rvmDecodeError sig "registerNamespace(address,uint256,string) parameter decoding failed"
+
   , action "sign(uint256,bytes32)" $
       \sig input -> case decodeStaticArgs 0 2 input of
         [sk, hash] ->
@@ -2393,6 +2502,81 @@ cheatActions = Map.fromList
           | member x seen = go seen xs
           | otherwise = x : go (insert x seen) xs
 
+    rvmDecodeError :: VMOps t => FunctionSelector -> String -> EVM t ()
+    rvmDecodeError sig msg = vmError (BadCheatCode msg sig)
+
+    resolveRvmSlot
+      :: (?conf :: Config, VMOps t, Typeable t)
+      => FunctionSelector
+      -> Addr
+      -> Text
+      -> ByteString
+      -> (RvmResolvedSlot -> EVM t ())
+      -> EVM t ()
+    resolveRvmSlot _sig target path keys continueResolved = do
+      refs <- fromMaybe mempty <$> use (#config % #rvmLayoutRefs % at target)
+      query $ PleaseResolveStorage target path keys refs $ \case
+        Left err -> continueOnce $
+          frameRevert (BS8.pack $ "RVM storage resolution failed: " <> unpack err)
+        Right resolved -> continueOnce (continueResolved resolved)
+
+    rvmLoadResolved
+      :: (?conf :: Config, VMOps t, Typeable t)
+      => FunctionSelector -> Addr -> RvmResolvedSlot -> EVM t ()
+    rvmLoadResolved sig target resolved@(RvmResolvedSlot slot _ _) =
+      case validateRvmResolvedSlot resolved of
+        Left err -> rvmDecodeError sig err
+        Right () -> fetchAccount (LitAddr target) $ \_ ->
+          accessStorage (LitAddr target) (Lit slot) $ \stored ->
+            frameReturnExpr $
+              writeWord (Lit 0) (extractRvmPacked resolved stored) (ConcreteBuf mempty)
+
+    rvmStoreResolved
+      :: (?conf :: Config, VMOps t, Typeable t)
+      => FunctionSelector -> Addr -> RvmResolvedSlot -> Expr EWord -> EVM t ()
+    rvmStoreResolved sig target resolved@(RvmResolvedSlot slot _ _) newValue =
+      case validateRvmResolvedSlot resolved of
+        Left err -> rvmDecodeError sig err
+        Right () -> fetchAccount (LitAddr target) $ \_ ->
+          accessStorage (LitAddr target) (Lit slot) $ \stored -> do
+            modifying (#env % #contracts % ix (LitAddr target) % #storage) $
+              writeStorage (Lit slot) (insertRvmPacked resolved stored newValue)
+            finishFrame (FrameReturned mempty)
+
+    validateRvmResolvedSlot :: RvmResolvedSlot -> Either String ()
+    validateRvmResolvedSlot (RvmResolvedSlot _ offset size)
+      | offset < 0 = Left "RVM packed offset must be non-negative"
+      | size < 1 || size > 32 = Left "RVM packed size must be between 1 and 32 bytes"
+      | offset > 32 - size = Left "RVM packed offset plus size exceeds one storage slot"
+      | otherwise = Right ()
+
+    rvmValueMask :: Int -> W256
+    rvmValueMask size
+      | size == 32 = maxBound
+      | otherwise = (1 `shiftL` (size * 8)) - 1
+
+    extractRvmPacked :: RvmResolvedSlot -> Expr EWord -> Expr EWord
+    extractRvmPacked (RvmResolvedSlot _ offset size) stored =
+      Expr.and
+        (Expr.shr (Lit $ fromIntegral (offset * 8)) stored)
+        (Lit $ rvmValueMask size)
+
+    insertRvmPacked
+      :: RvmResolvedSlot -> Expr EWord -> Expr EWord -> Expr EWord
+    insertRvmPacked (RvmResolvedSlot _ offset size) stored newValue =
+      let shiftBits = offset * 8
+          valueMask = rvmValueMask size
+          slotMask = valueMask `shiftL` shiftBits
+          cleared = Expr.and stored (Lit $ complement slotMask)
+          inserted = Expr.shl (Lit $ fromIntegral shiftBits) $
+            Expr.and newValue (Lit valueMask)
+      in Expr.or cleared inserted
+
+    appendRvmLayoutRef :: Addr -> RvmLayoutRef -> EVM t ()
+    appendRvmLayoutRef target ref =
+      modifying (#config % #rvmLayoutRefs) $
+        Map.alter (Just . maybe [ref] (<> [ref])) target
+
     dealErc20 sig tokenW toW giveW adjustW =
       whenSymbolicElse
         (vmError (BadCheatCode "deal(address,address,uint256[,bool]) not supported in symbolic mode" sig))
@@ -2515,7 +2699,9 @@ cheatActions = Map.fromList
               , txdataFloorGas = vm.tx.txdataFloorGas
               }
         nested0' <- lift $ makeVm opts
-        let nested0 = nested0' & set (#config % #traceEnabled) vm.config.traceEnabled
+        let nested0 = nested0'
+              & set (#config % #traceEnabled) vm.config.traceEnabled
+              & set (#config % #rvmLayoutRefs) vm.config.rvmLayoutRefs
         nested1 <- lift $ execStateT (assign (#state % #static) True) nested0
         runNestedVM nested1 $ \nestedF -> do
           let
@@ -2581,6 +2767,11 @@ cheatActions = Map.fromList
         query $ PleaseGetCode path $ \val -> do
           assign #result Nothing
           nested' <- lift $ execStateT (k val) nested
+          runNestedVM nested' cont
+      PleaseResolveStorage addr path keys refs k ->
+        query $ PleaseResolveStorage addr path keys refs $ \resolved -> do
+          assign #result Nothing
+          nested' <- lift $ execStateT (k resolved) nested
           runNestedVM nested' cont
     either' v l r = either l r v
     frameReturn :: VMOps t => AbiValue -> EVM t ()
