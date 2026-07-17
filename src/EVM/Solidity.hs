@@ -53,7 +53,7 @@ import EVM.Expr (maybeLitByteSimp)
 import Control.Applicative
 import Control.Monad
 import Control.Monad.IO.Unlift
-import Data.Aeson (encode)
+import Data.Aeson.Text qualified as AesonText
 import Data.Aeson.Types
 import Data.Aeson.Optics
 import Data.Aeson.Key qualified as Key
@@ -62,7 +62,6 @@ import Data.Scientific
 import Data.ByteString (ByteString, readFile)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base16 qualified as BS16
-import Data.ByteString.Lazy (toStrict)
 import Data.Char (isDigit)
 import Data.Foldable
 import Data.Map.Strict (Map)
@@ -76,6 +75,7 @@ import Data.Sequence (Seq)
 import Data.Text (pack, intercalate)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8, decodeUtf8)
+import Data.Text.Lazy qualified as TL
 import Data.Vector (Vector)
 import Data.Vector qualified as Vector
 import Data.Word (Word8)
@@ -763,7 +763,7 @@ instance ToJSON StandardJSON where
            ]
 
 stdjson :: Language -> Text -> Bool -> Text
-stdjson lang src viaIR = decodeUtf8 $ toStrict $ encode $ StandardJSON lang src viaIR
+stdjson lang src viaIR = TL.toStrict . AesonText.encodeToLazyText $ StandardJSON lang src viaIR
 
 -- | When doing CREATE and passing constructor arguments, Solidity loads
 -- the argument data via the creation bytecode, since there is no "calldata"

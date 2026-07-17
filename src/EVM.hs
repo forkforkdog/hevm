@@ -27,10 +27,10 @@ import EVM.Concrete qualified as Concrete
 import EVM.CheatsTH
 import EVM.Effects (Config (..))
 
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
 import Control.Monad.ST (ST, RealWorld)
-import Control.Monad.State.Strict (MonadState, State, get, gets, lift, modify', put)
-import Data.Bits (FiniteBits, countLeadingZeros, finiteBitSize)
+import Control.Monad.State.Strict (MonadState, State, get, gets, lift, modify', put, execStateT)
+import Data.Bits (FiniteBits, countLeadingZeros, finiteBitSize, shiftR, (.&.))
 import Data.ByteArray qualified as BA
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -52,7 +52,6 @@ import Data.Set (insert, member, fromList)
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
 import Data.Text (unpack, pack)
-import Data.Text.Encoding (decodeUtf8)
 import Data.Tree
 import Data.Tree.Zipper qualified as Zipper
 import Data.Typeable
@@ -64,9 +63,11 @@ import Data.Word (Word8, Word64)
 import Text.Read (readMaybe)
 import Witch (into, tryFrom, unsafeInto, tryInto)
 
+import Crypto.Error (CryptoFailable(..))
 import Crypto.Hash (Digest, SHA256, RIPEMD160)
 import Crypto.Hash qualified as Crypto
 import Crypto.Number.ModArithmetic (expFast)
+import Crypto.PubKey.ECC.P256 qualified as P256
 
 defaultVMOpts :: VMOps t => VMOpts t
 defaultVMOpts = VMOpts
@@ -164,6 +165,9 @@ makeVm o = do
       , isCreate = o.create
       , txReversion = Map.fromList ((o.address,o.contract):o.otherContracts)
       , txdataFloorGas = o.txdataFloorGas
+      , recordingStorageAccesses = False
+      , recordedStorageReads = mempty
+      , recordedStorageWrites = mempty
       }
     , logs = []
     , traces = Zipper.fromForest []
@@ -192,6 +196,7 @@ makeVm o = do
     , config = RuntimeConfig
       { allowFFI = o.allowFFI
       , baseState = o.baseState
+      , traceEnabled = True
       }
     , forks = Seq.singleton (ForkState env block mempty "")
     , currentFork = 0
@@ -754,7 +759,9 @@ exec1 conf = do
                     ConcreteMemory mem -> do
                       case y of
                         Lit w ->
-                          copyBytesToMemory (ConcreteBuf (word256Bytes w)) (Lit 32) (Lit 0) x
+                          case x of
+                            Lit offset -> writeMemoryWord256 mem (unsafeInto offset) w
+                            _ -> copyBytesToMemory (ConcreteBuf (word256Bytes w)) (Lit 32) (Lit 0) x
                         _ -> do
                           -- copy out and move to symbolic memory
                           buf <- freezeMemory mem
@@ -775,7 +782,9 @@ exec1 conf = do
                     ConcreteMemory mem -> do
                       case yByte of
                         LitByte byte ->
-                          copyBytesToMemory (ConcreteBuf (BS.pack [byte])) (Lit 1) (Lit 0) x
+                          case x of
+                            Lit offset -> writeMemoryByte mem (unsafeInto offset) byte
+                            _ -> copyBytesToMemory (ConcreteBuf (BS.pack [byte])) (Lit 1) (Lit 0) x
                         _ -> do
                           -- copy out and move to symbolic memory
                           buf <- freezeMemory mem
@@ -792,16 +801,22 @@ exec1 conf = do
               let
                 finalizeLoad readValue = do next; assign' (#state % #stack) (readValue:xs)
 
-                symbolicRead :: EVM t () = if this.external
-                  then accessStorage self x finalizeLoad
-                  else finalizeLoad $ Expr.readStorage' (Expr.concKeccakOnePass x) this.storage
+                symbolicRead :: EVM t () = do
+                  case maybeLitWordSimp x of
+                    Nothing -> pure ()
+                    Just slot -> recordStorageRead self slot
+                  if this.external
+                    then accessStorage self x finalizeLoad
+                    else finalizeLoad $ Expr.readStorage' (Expr.concKeccakOnePass x) this.storage
 
                 concreteRead :: EVM t () = do
-                  acc <- accessStorageForGas self (forceLit x)
+                  let slot = forceLit x
+                  acc <- accessStorageForGas self slot
+                  recordStorageRead self slot
                   let cost = if acc then g_warm_storage_read else g_cold_sload
                   burn cost $ if this.external
                     then accessStorage self x finalizeLoad
-                    else finalizeLoad $ Lit $ accessConcreteStorage this.storage (forceLit x)
+                    else finalizeLoad $ Lit $ accessConcreteStorage this.storage slot
               in whenSymbolicElse symbolicRead concreteRead
             _ -> underrun
 
@@ -811,6 +826,9 @@ exec1 conf = do
             x:new:xs ->
               let
                 updateVMState :: EVM t () = do
+                  case maybeLitWordSimp x of
+                    Nothing -> pure ()
+                    Just slot -> recordStorageWrite self slot
                   next
                   assign' (#state % #stack) xs
                   modifying (#env % #contracts % ix self % #storage) (writeStorage x new)
@@ -821,6 +839,7 @@ exec1 conf = do
                     currentVal = accessConcreteStorage this.storage slot
                     newVal = forceLit new
                     originalVal = accessConcreteStorage this.origStorage slot
+                  recordStorageWrite self slot
                   ensureGas g_callstipend $ do
                     let storage_cost
                           | (currentVal == newVal) = g_sload
@@ -1070,7 +1089,7 @@ exec1 conf = do
                       touchAddress from'
 
                       let (cost, gas') = costOfCreate fees availableGas xSize True
-                      newAddr <- create2Address self xSalt initCode
+                      newAddr <- create2Address from' xSalt initCode
                       _ <- accessAccountForGas newAddr
                       burn' cost $
                         create from' this xSize gas' xValue xs newAddr (ConcreteBuf initCode)
@@ -1417,12 +1436,74 @@ executePrecompile preCompileAddr gasCap inOffset inSize outOffset outSize xs  = 
               Nothing -> precompileFail
             _ -> precompileFail
 
+      -- P256VERIFY
+      0x100 ->
+        -- TODO: support symbolic variant
+        forceConcreteBuf input "P256VERIFY" $ \input' -> do
+          assign' (#state % #stack) (Lit 1 : xs)
+          if p256VerifyInput input'
+            then do
+              let output = ConcreteBuf (word256Bytes 1)
+              assign (#state % #returndata) output
+              copyBytesToMemory output outSize (Lit 0) outOffset
+              next
+            else do
+              assign (#state % #returndata) mempty
+              next
+
       _ -> notImplemented
 
 truncpadlit :: Int -> ByteString -> ByteString
 truncpadlit n xs = if m > n then BS.take n xs
                    else BS.append xs (BS.replicate (n - m) 0)
   where m = BS.length xs
+
+p256VerifyInput :: ByteString -> Bool
+p256VerifyInput input
+  | BS.length input /= 160 = False
+  | otherwise =
+    p256Verify h r s qx qy
+  where
+    h  = readInteger 0
+    r  = readInteger 32
+    s  = readInteger 64
+    qx = readInteger 96
+    qy = readInteger 128
+    readInteger :: W256 -> Integer
+    readInteger offset = asInteger $ lazySlice offset 32 input
+
+p256Verify :: Integer -> Integer -> Integer -> Integer -> Integer -> Bool
+p256Verify h r s qx qy =
+  inRange r && inRange s &&
+    let q = P256.pointFromIntegers (qx, qy)
+    in P256.pointIsValid q &&
+       not (P256.pointIsAtInfinity q) &&
+       case p256Scalar s of
+         Nothing -> False
+         Just sScalar ->
+           let w  = P256.scalarInv sScalar
+               u1 = p256ScalarZeroOk $ (h * P256.scalarToInteger w) `mod` p256Order
+               u2 = p256ScalarZeroOk $ (r * P256.scalarToInteger w) `mod` p256Order
+           in case (u1, u2) of
+                (Just u1Scalar, Just u2Scalar) ->
+                  let p = P256.pointsMulVarTime u1Scalar u2Scalar q
+                      (x, _) = P256.pointToIntegers p
+                  in not (P256.pointIsAtInfinity p) && (x `mod` p256Order) == r
+                _ -> False
+  where
+    inRange x = 0 < x && x < p256Order
+
+p256Scalar :: Integer -> Maybe P256.Scalar
+p256Scalar i = case P256.scalarFromInteger i of
+  CryptoPassed scalar -> Just scalar
+  CryptoFailed _ -> Nothing
+
+p256ScalarZeroOk :: Integer -> Maybe P256.Scalar
+p256ScalarZeroOk 0 = Just P256.scalarZero
+p256ScalarZeroOk i = p256Scalar i
+
+p256Order :: Integer
+p256Order = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
 
 lazySlice :: W256 -> W256 -> ByteString -> LS.ByteString
 lazySlice offset size bs =
@@ -1854,6 +1935,24 @@ accessStorageForGas addr key = do
   unless accessed $ assign (#tx % #subState % #accessedStorageKeys) (insert (addr, key) accessedStrkeys)
   pure accessed
 
+recordStorageRead :: Expr EAddr -> W256 -> EVM t ()
+recordStorageRead addr key = do
+  rec <- use (#tx % #recordingStorageAccesses)
+  when rec $
+    modifying (#tx % #recordedStorageReads) (pushUniqueStorageAccess (addr, key))
+
+recordStorageWrite :: Expr EAddr -> W256 -> EVM t ()
+recordStorageWrite addr key = do
+  rec <- use (#tx % #recordingStorageAccesses)
+  when rec $ do
+    modifying (#tx % #recordedStorageWrites) (pushUniqueStorageAccess (addr, key))
+    modifying (#tx % #recordedStorageReads) (pushUniqueStorageAccess (addr, key))
+
+pushUniqueStorageAccess :: Eq a => a -> [a] -> [a]
+pushUniqueStorageAccess x xs
+  | x `elem` xs = xs
+  | otherwise = x : xs
+
 -- * Cheat codes
 
 -- The cheat code is 7109709ecfa91a80626ff3989d68f67f5b1dd12d.
@@ -1926,6 +2025,22 @@ cheatActions = Map.fromList
             _ -> vmError (BadCheatCode "ffi(string[]) parameter decoding failed" sig)
         else vmError $ BadCheatCode "ffi disabled: run again with --ffi if you want to allow tests to call external scripts" sig
 
+  , action "getCode(string)" $
+      \sig input -> do
+        vm <- get
+        if vm.config.allowFFI then
+          case decodeBuf [AbiStringType] input of
+            (CAbi [AbiString artifactRefBytes], "") -> do
+              let artifactRef = toString artifactRefBytes
+              let cont = \case
+                    Left err ->
+                      continueOnce $ frameRevert (BS8.pack err)
+                    Right codeBytes ->
+                      continueOnce $ frameReturn $ AbiTuple $ V.fromList [AbiBytesDynamic codeBytes]
+              query (PleaseGetCode artifactRef cont)
+            _ -> vmError (BadCheatCode "getCode(string) parameter decoding failed" sig)
+        else vmError $ BadCheatCode "getCode disabled: run again with --ffi if you want to allow tests to read artifacts" sig
+
   , action "warp(uint256)" $
       \sig input -> case decodeStaticArgs 0 1 input of
         [x]  -> do
@@ -1942,6 +2057,18 @@ cheatActions = Map.fromList
               doStop
         _ -> vmError (BadCheatCode "deal(address,uint256) parameter decoding failed" sig)
 
+  , action "deal(address,address,uint256)" $
+      \sig input -> case decodeStaticArgs 0 3 input of
+        [token, to_, give] ->
+          dealErc20 sig token to_ give (Lit 0)
+        _ -> vmError (BadCheatCode "deal(address,address,uint256) parameter decoding failed" sig)
+
+  , action "deal(address,address,uint256,bool)" $
+      \sig input -> case decodeStaticArgs 0 4 input of
+        [token, to_, give, adjust] ->
+          dealErc20 sig token to_ give adjust
+        _ -> vmError (BadCheatCode "deal(address,address,uint256,bool) parameter decoding failed" sig)
+
   , action "assume(bool)" $
       \sig input -> case decodeStaticArgs 0 1 input of
         [c] -> do
@@ -1957,6 +2084,46 @@ cheatActions = Map.fromList
           assign (#block % #number) x
           doStop
         _ -> vmError (BadCheatCode "roll(uint256) parameter decoding failed" sig)
+
+  , action "record()" $
+      \_ _ -> do
+        assign (#tx % #recordingStorageAccesses) True
+        assign (#tx % #recordedStorageReads) []
+        assign (#tx % #recordedStorageWrites) []
+        doStop
+
+  , action "accesses(address)" $
+      \sig input -> case decodeStaticArgs 0 1 input of
+        [a] -> case wordToAddr a of
+          Just a'@(LitAddr _) -> do
+            tx <- use #tx
+            if not tx.recordingStorageAccesses
+              then frameReturn $ AbiTuple $ V.fromList
+                [ AbiArrayDynamic (AbiBytesType 32) V.empty
+                , AbiArrayDynamic (AbiBytesType 32) V.empty
+                ]
+              else do
+                let readsSlots =
+                      uniqPreserveOrder
+                        [ slot
+                        | (addrExpr, slot) <- reverse tx.recordedStorageReads
+                        , addrExpr == a'
+                        ]
+                    writeSlots =
+                      uniqPreserveOrder
+                        [ slot
+                        | (addrExpr, slot) <- reverse tx.recordedStorageWrites
+                        , addrExpr == a'
+                        ]
+                    toBytes32 w = AbiBytes 32 (word256Bytes w)
+                    readsV = V.fromList (fmap toBytes32 readsSlots)
+                    writesV = V.fromList (fmap toBytes32 writeSlots)
+                frameReturn $ AbiTuple $ V.fromList
+                  [ AbiArrayDynamic (AbiBytesType 32) readsV
+                  , AbiArrayDynamic (AbiBytesType 32) writesV
+                  ]
+          _ -> vmError (BadCheatCode "accesses(address): could not decode address" sig)
+        _ -> vmError (BadCheatCode "accesses(address) parameter decoding failed" sig)
 
   , action "store(address,bytes32,bytes32)" $
       \sig input -> case decodeStaticArgs 0 3 input of
@@ -2076,7 +2243,7 @@ cheatActions = Map.fromList
       \sig input -> case decodeBuf [AbiAddressType, AbiStringType] input of
         (CAbi valsArr,"") -> case valsArr of
           [AbiAddress addr, AbiString label] -> do
-            #labels %= Map.insert addr (decodeUtf8 label)
+            #labels %= Map.insert addr (pack (toString label))
             doStop
           _ -> vmError (BadCheatCode "label(address,string) address decoding failed" sig)
         _ -> vmError (BadCheatCode "label(address,string) parameter decoding failed" sig)
@@ -2217,6 +2384,204 @@ cheatActions = Map.fromList
   ]
   where
     action s f = (abiKeccak s, f (abiKeccak s))
+
+    uniqPreserveOrder :: Ord a => [a] -> [a]
+    uniqPreserveOrder = go mempty
+      where
+        go _ [] = []
+        go seen (x:xs)
+          | member x seen = go seen xs
+          | otherwise = x : go (insert x seen) xs
+
+    dealErc20 sig tokenW toW giveW adjustW =
+      whenSymbolicElse
+        (vmError (BadCheatCode "deal(address,address,uint256[,bool]) not supported in symbolic mode" sig))
+        (forceAddr tokenW (unexpectedSymArgW "deal(erc20): cannot decode token into an address") $ \tokenE ->
+            forceAddr toW (unexpectedSymArgW "deal(erc20): cannot decode recipient into an address") $ \toE ->
+              forceConcreteAddr tokenE "deal(erc20): token must be concrete" $ \token ->
+              forceConcreteAddr toE "deal(erc20): recipient must be concrete" $ \toAddr ->
+                forceConcrete giveW "deal(erc20): give must be concrete" $ \give ->
+                  forceConcrete adjustW "deal(erc20): adjustTotalSupply must be concrete" $ \adjWord -> do
+                    let adjustTotalSupply = adjWord /= 0
+                    let cdBal = erc20BalanceOfSel <> word256Bytes (fromIntegral toAddr :: W256)
+                    callTarget token cdBal $ \(succPrev, _retPrev, retWordPrev, _readsPrev) ->
+                      if not succPrev then frameRevert "deal: balanceOf call failed"
+                      else do
+                        let prevBal = retWordPrev
+                        checkedWrite token cdBal give $ do
+                          if not adjustTotalSupply then doStop
+                          else do
+                            let cdTot = erc20TotalSupplySel
+                            callTarget token cdTot $ \(succSup, _retSup, retWordSup, _readsSup) ->
+                              if not succSup then frameRevert "deal: totalSupply call failed"
+                              else case adjustSupplyChecked retWordSup prevBal give of
+                                Left () -> finishFrame (FrameReverted (ConcreteBuf panicArithmetic))
+                                Right totalSupply' -> checkedWrite token cdTot totalSupply' doStop
+        )
+
+    erc20BalanceOfSel :: ByteString
+    erc20BalanceOfSel = BS.pack [0x70, 0xa0, 0x82, 0x31]
+
+    erc20TotalSupplySel :: ByteString
+    erc20TotalSupplySel = BS.pack [0x18, 0x16, 0x0d, 0xdd]
+
+    panicArithmetic :: ByteString
+    panicArithmetic = selector "Panic(uint256)" <> word256Bytes (0x11 :: W256)
+
+    adjustSupplyChecked :: W256 -> W256 -> W256 -> Either () W256
+    adjustSupplyChecked totalSupply prevBal give
+      | give < prevBal =
+          let delta = prevBal - give
+          in if totalSupply < delta then Left () else Right (totalSupply - delta)
+      | otherwise =
+          let delta = give - prevBal
+          in if totalSupply > (maxBound - delta) then Left () else Right (totalSupply + delta)
+
+    checkedWrite token cd setVal cont =
+      callTarget token cd $ \(succ0, _ret, callResult, readSlots0) -> do
+        unless succ0 $ frameRevert "checked_write: initial call failed"
+        if null readSlots0 then frameRevert "checked_write: no storage use detected"
+        else
+          findSlot token cd callResult (reverse readSlots0) $ \slot -> do
+            loadSlot token slot $ \curVal -> do
+              storeSlot token slot setVal
+              callTarget token cd $ \(succ1, _ret1, callResult1, _reads1) ->
+                if succ1 && callResult1 == setVal then cont
+                else do
+                  storeSlot token slot curVal
+                  frameRevert "checked_write: failed to write value"
+
+    findSlot _ _ _ [] _ = frameRevert "checked_write: slot not found"
+    findSlot token cd callResult (slot:rest) cont = do
+      loadSlot token slot $ \prev -> do
+        if prev /= callResult
+          then findSlot token cd callResult rest cont
+          else checkSlotMutatesCall token cd slot $ \ok ->
+            if ok then cont slot else findSlot token cd callResult rest cont
+
+    checkSlotMutatesCall token cd slot cont = do
+      loadSlot token slot $ \prevSlotValue -> do
+        callTarget token cd $ \(success0, _ret0, prevReturnValue, _reads0) -> do
+          let testVal = if prevReturnValue == 0 then maxBound else 0
+          storeSlot token slot testVal
+          callTarget token cd $ \(_success1, _ret1, newReturnValue, _reads1) -> do
+            storeSlot token slot prevSlotValue
+            cont (success0 && prevReturnValue /= newReturnValue)
+
+    loadSlot token slot cont =
+      accessStorage (LitAddr token) (Lit slot) $ \res ->
+        forceConcrete res "deal(erc20): storage read must be concrete" cont
+
+    storeSlot token slot val =
+      fetchAccount (LitAddr token) $ \_ -> do
+        modifying (#env % #contracts % ix (LitAddr token) % #storage) (writeStorage (Lit slot) (Lit val))
+
+    callTarget token cd cont =
+      fetchAccount (LitAddr token) $ \targetContr -> do
+        vm <- get
+        let nestedGas = case vm.frames of
+              Frame { state = st } : _ -> st.gas
+              _ -> vm.state.gas
+            allContracts = vm.env.contracts
+            others = Map.toList $ Map.delete (LitAddr token) allContracts
+            opts = VMOpts
+              { contract = targetContr
+              , otherContracts = others
+              , calldata = (ConcreteBuf cd, [])
+              , baseState = vm.config.baseState
+              , value = Lit 0
+              , priorityFee = vm.tx.priorityFee
+              , address = LitAddr token
+              , caller = vm.state.contract
+              , origin = vm.tx.origin
+              , gas = nestedGas
+              , gaslimit = vm.tx.gaslimit
+              , number = vm.block.number
+              , timestamp = vm.block.timestamp
+              , coinbase = vm.block.coinbase
+              , prevRandao = vm.block.prevRandao
+              , maxCodeSize = vm.block.maxCodeSize
+              , blockGaslimit = vm.block.gaslimit
+              , gasprice = vm.tx.gasprice
+              , baseFee = vm.block.baseFee
+              , schedule = vm.block.schedule
+              , chainId = vm.env.chainId
+              , create = False
+              , txAccessList = mempty
+              , allowFFI = False
+              , freshAddresses = vm.env.freshAddresses
+              , beaconRoot = 0
+              , parentHash = 0
+              , txdataFloorGas = vm.tx.txdataFloorGas
+              }
+        nested0' <- lift $ makeVm opts
+        let nested0 = nested0' & set (#config % #traceEnabled) vm.config.traceEnabled
+        nested1 <- lift $ execStateT (assign (#state % #static) True) nested0
+        runNestedVM nested1 $ \nestedF -> do
+          let
+            (success, outExpr) = case nestedF.result of
+              Just (VMSuccess out) -> (True, out)
+              Just (VMFailure (Revert out)) -> (False, out)
+              Just (VMFailure _) -> (False, ConcreteBuf "")
+              _ -> (False, ConcreteBuf "")
+            outBytes = case outExpr of
+              ConcreteBuf bs -> bs
+              _ -> mempty
+            outWord = fromMaybe 0 (maybeLitWordSimp (readWord (Lit 0) outExpr))
+            readSlots =
+              [ s
+              | (addrExpr, s) <- toList nestedF.tx.subState.accessedStorageKeys
+              , addrExpr == LitAddr token
+              ]
+          cont (success, outBytes, outWord, readSlots)
+
+    runNestedVM :: (?conf :: Config, VMOps t, Typeable t) => VM t -> (VM t -> EVM t ()) -> EVM t ()
+    runNestedVM vm0 cont = do
+      vm1 <- lift $ execStateT (exec1 ?conf) vm0
+      case vm1.result of
+        Nothing -> runNestedVM vm1 cont
+        Just (HandleEffect (Query q)) -> runNestedQuery vm1 q cont
+        Just _ -> cont vm1
+
+    runNestedQuery :: (?conf :: Config, VMOps t, Typeable t) => VM t -> Query t -> (VM t -> EVM t ()) -> EVM t ()
+    runNestedQuery nested q cont = case q of
+      PleaseFetchContract addr base k ->
+        query $ PleaseFetchContract addr base $ \c -> do
+          assign #result Nothing
+          assign (#env % #contracts % at (LitAddr addr)) (Just c)
+          nested' <- lift $ execStateT (k c) nested
+          runNestedVM nested' cont
+      PleaseFetchSlot addr slot k ->
+        query $ PleaseFetchSlot addr slot $ \x -> do
+          assign #result Nothing
+          modifying (#env % #contracts % ix (LitAddr addr) % #storage) (writeStorage (Lit slot) (Lit x))
+          nested' <- lift $ execStateT (k x) nested
+          runNestedVM nested' cont
+      PleaseAskSMT condition constraints k ->
+        query $ PleaseAskSMT condition constraints $ \bc -> do
+          assign #result Nothing
+          nested' <- lift $ execStateT (k bc) nested
+          runNestedVM nested' cont
+      PleaseGetSols expr numBytes constraints k ->
+        query $ PleaseGetSols expr numBytes constraints $ \sols -> do
+          assign #result Nothing
+          nested' <- lift $ execStateT (k sols) nested
+          runNestedVM nested' cont
+      PleaseReadEnv var k ->
+        query $ PleaseReadEnv var $ \val -> do
+          assign #result Nothing
+          nested' <- lift $ execStateT (k val) nested
+          runNestedVM nested' cont
+      PleaseDoFFI cmd env k ->
+        query $ PleaseDoFFI cmd env $ \bs -> do
+          assign #result Nothing
+          nested' <- lift $ execStateT (k bs) nested
+          runNestedVM nested' cont
+      PleaseGetCode path k ->
+        query $ PleaseGetCode path $ \val -> do
+          assign #result Nothing
+          nested' <- lift $ execStateT (k val) nested
+          runNestedVM nested' cont
     either' v l r = either l r v
     frameReturn :: VMOps t => AbiValue -> EVM t ()
     frameReturn v = frameReturnBuf $ encodeAbiValue v
@@ -2230,7 +2595,12 @@ cheatActions = Map.fromList
       assign #result Nothing
       cont
     doStop = finishFrame (FrameReturned mempty)
-    toString = unpack . decodeUtf8
+    toString = stripQuotes . formatString
+    stripQuotes ('"':rest) =
+      case reverse rest of
+        '"':body -> reverse body
+        _ -> '"' : rest
+    stripQuotes s = s
     strip0x s = if "0x" `isPrefixOf` s then drop 2 s else s
     stringToBool :: String -> Either ByteString Bool
     stringToBool s = case s of
@@ -2724,7 +3094,12 @@ replaceCodeOfSelf newCode = do
 resetState :: VMOps t => EVM t ()
 resetState = do
   state <- lift blankState
-  modify' $ \vm -> vm { result = Nothing, frames = [], state }
+  modify' $ \vm -> vm
+    { result = Nothing
+    , frames = []
+    , state
+    , traces = Zipper.fromForest []
+    }
 
 -- * VM error implementation
 
@@ -3008,15 +3383,24 @@ copyBytesToMemory bs size srcOffset memOffset =
       ConcreteMemory mem ->
         case (bs, size, srcOffset, memOffset) of
           (ConcreteBuf b, Lit size', Lit srcOffset', Lit memOffset') -> do
-            let src =
-                  if srcOffset' >= unsafeInto (BS.length b) then
-                    BS.replicate (unsafeInto size') 0
-                  else
-                    BS.take (unsafeInto size') $
-                    padRight (unsafeInto size') $
-                    BS.drop (unsafeInto srcOffset') b
-
-            writeMemory mem (unsafeInto memOffset') src
+            let memOffsetInt = unsafeInto memOffset' :: Int
+                sizeInt = unsafeInto size' :: Int
+                srcLen = BS.length b
+                srcPastEnd = srcOffset' >= unsafeInto srcLen
+                srcOffsetInt = if srcPastEnd then 0 else unsafeInto srcOffset'
+                available = if srcPastEnd then 0 else min sizeInt (srcLen - srcOffsetInt)
+                zeroLen = sizeInt - available
+            memory' <- expandConcreteMemory mem (memOffsetInt + sizeInt)
+            when (available > 0) $ do
+              let src = byteStringToVector $
+                    BS.take available $
+                    BS.drop srcOffsetInt b
+                  dst = VS.Mutable.slice memOffsetInt available memory'
+              VS.unsafeCopy dst src
+            when (zeroLen > 0) $
+              VS.Mutable.set
+                (VS.Mutable.slice (memOffsetInt + available) zeroLen memory')
+                0
           _ -> do
             -- copy out and move to symbolic memory
             buf <- freezeMemory mem
@@ -3062,30 +3446,64 @@ withTraceLocation :: TraceData -> EVM t Trace
 withTraceLocation x = do
   vm <- get
   let this = fromJust $ currentContract vm
+      traceContract =
+        this
+          { storage = ConcreteStore mempty
+          , tStorage = ConcreteStore mempty
+          , origStorage = ConcreteStore mempty
+          }
+      traceSubState = SubState [] [] mempty mempty [] mempty
+      traceContext = \case
+        c@CallContext {} ->
+          c { callreversion = mempty
+            , subState = traceSubState
+            }
+        c@CreationContext {} ->
+          c { createreversion = mempty
+            , subState = traceSubState
+            }
+      traceData = \case
+        FrameTrace context -> FrameTrace (traceContext context)
+        ReturnTrace output context -> ReturnTrace output (traceContext context)
+        other -> other
   pure Trace
-    { tracedata = x
-    , contract = this
+    { tracedata = traceData x
+    , contract = traceContract
     , opIx = fromMaybe 0 $ this.opIxMap VS.!? vm.state.pc
     }
 
+traceDataEnabled :: Bool -> TraceData -> Bool
+traceDataEnabled enabled x =
+  enabled ||
+    case x of
+      ErrorTrace _ -> True
+      ConsoleLog _ -> True
+      _ -> False
+
 pushTrace :: TraceData -> EVM t ()
 pushTrace x = do
-  trace <- withTraceLocation x
-  modifying #traces $
-    \t -> Zipper.children $ Zipper.insert (Node trace []) t
+  enabled <- use (#config % #traceEnabled)
+  when (traceDataEnabled enabled x) $ do
+    trace <- withTraceLocation x
+    modifying #traces $
+      \t -> Zipper.children $ Zipper.insert (Node trace []) t
 
 insertTrace :: TraceData -> EVM t ()
 insertTrace x = do
-  trace <- withTraceLocation x
-  modifying #traces $
-    \t -> Zipper.nextSpace $ Zipper.insert (Node trace []) t
+  enabled <- use (#config % #traceEnabled)
+  when (traceDataEnabled enabled x) $ do
+    trace <- withTraceLocation x
+    modifying #traces $
+      \t -> Zipper.nextSpace $ Zipper.insert (Node trace []) t
 
 popTrace :: EVM t ()
-popTrace =
-  modifying #traces $
-    \t -> case Zipper.parent t of
-            Nothing -> internalError "internal internalError(trace root)"
-            Just t' -> Zipper.nextSpace t'
+popTrace = do
+  enabled <- use (#config % #traceEnabled)
+  when enabled $
+    modifying #traces $
+      \t -> case Zipper.parent t of
+              Nothing -> internalError "internal internalError(trace root)"
+              Just t' -> Zipper.nextSpace t'
 
 zipperRootForest :: Zipper.TreePos Zipper.Empty a -> Forest a
 zipperRootForest z =
@@ -3111,9 +3529,11 @@ traceContext (GVar {}) = internalError"Internal Error: Unexpected GVar"
 traceTopLog :: [Expr Log] -> EVM t ()
 traceTopLog [] = noop
 traceTopLog ((LogEntry addr bytes topics) : _) = do
-  trace <- withTraceLocation (EventTrace addr bytes topics)
-  modifying #traces $
-    \t -> Zipper.nextSpace (Zipper.insert (Node trace []) t)
+  enabled <- use (#config % #traceEnabled)
+  when (traceDataEnabled enabled (EventTrace addr bytes topics)) $ do
+    trace <- withTraceLocation (EventTrace addr bytes topics)
+    modifying #traces $
+      \t -> Zipper.nextSpace (Zipper.insert (Node trace []) t)
 traceTopLog ((GVar _) : _) = internalError "unexpected global variable"
 
 -- * Stack manipulation
@@ -3385,6 +3805,8 @@ costOfPrecompile (FeeSchedule {..}) precompileAddr input =
     0x9 -> case input of
              ConcreteBuf i -> g_fround * (unsafeInto $ asInteger $ lazySlice 0 4 i)
              _ -> internalError "Unsupported symbolic blake2 gas calc"
+    -- P256VERIFY
+    0x100 -> g_p256verify
     _ -> internalError $ "unimplemented precompiled contract " ++ show precompileAddr
 
 -- Gas cost of memory expansion
@@ -3472,26 +3894,38 @@ log2 x = finiteBitSize x - 1 - countLeadingZeros x
 
 writeMemory :: MutableMemory -> Int -> ByteString -> EVM t ()
 writeMemory memory offset buf = do
-  memory' <- expandMemory (offset + BS.length buf)
-  VS.iforM_ (byteStringToVector buf) $ \i v -> do
-    VS.Mutable.unsafeWrite memory' (offset + i) v
-  where
-  expandMemory requiredSize = do
-    let currentSize = VS.Mutable.length memory
-    let toAlloc = requiredSize - currentSize
-    if toAlloc > 0 then do
-      -- As grow does a larger *copy* of the vector on a new place,
-      -- we double the vector size to avoid the performance impact
-      -- that would happen with repeated small expansion operations.
-      let growthFactor = 2
-      let targetSize = requiredSize * growthFactor
-      -- Always grow at least 8k
-      let toGrow = max 8192 $ targetSize - currentSize
-      memory' <- VS.Mutable.grow memory toGrow
-      assign (#state % #memory) (ConcreteMemory memory')
-      pure memory'
-    else
-      pure memory
+  memory' <- expandConcreteMemory memory (offset + BS.length buf)
+  let src = byteStringToVector buf
+      dst = VS.Mutable.slice offset (VS.length src) memory'
+  VS.unsafeCopy dst src
+
+writeMemoryWord256 :: MutableMemory -> Int -> W256 -> EVM t ()
+writeMemoryWord256 memory offset word = do
+  memory' <- expandConcreteMemory memory (offset + 32)
+  forM_ [0 .. 31] $ \i ->
+    VS.Mutable.unsafeWrite memory' (offset + i) $
+      fromIntegral ((word `shiftR` ((31 - i) * 8)) .&. 0xff)
+
+writeMemoryByte :: MutableMemory -> Int -> Word8 -> EVM t ()
+writeMemoryByte memory offset byte = do
+  memory' <- expandConcreteMemory memory (offset + 1)
+  VS.Mutable.unsafeWrite memory' offset byte
+
+expandConcreteMemory :: MutableMemory -> Int -> EVM t MutableMemory
+expandConcreteMemory memory requiredSize = do
+  let currentSize = VS.Mutable.length memory
+  let toAlloc = requiredSize - currentSize
+  if toAlloc > 0 then do
+    -- Keep concrete memory close to the logical EVM size. The previous 2x
+    -- growth policy retains large transient vectors for low-level calls with
+    -- dynamic bytes return data.
+    let targetSize = requiredSize
+    let toGrow = max 8192 $ targetSize - currentSize
+    memory' <- VS.Mutable.grow memory toGrow
+    assign (#state % #memory) (ConcreteMemory memory')
+    pure memory'
+  else
+    pure memory
 
 freezeMemory :: MutableMemory -> EVM t (Expr Buf)
 freezeMemory memory =

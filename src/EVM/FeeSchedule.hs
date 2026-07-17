@@ -45,6 +45,7 @@ data FeeSchedule n = FeeSchedule
   , g_pairing_point :: n
   , g_pairing_base :: n
   , g_fround :: n
+  , g_p256verify :: n
   , r_block :: n
   , g_cold_sload :: n
   , g_cold_account_access :: n
@@ -100,6 +101,7 @@ feeSchedule = FeeSchedule
   , g_pairing_point = 34000
   , g_pairing_base = 45000
   , g_fround = 1
+  , g_p256verify = 6900
   , r_block = 2000000000000000000
   , g_cold_sload = 2100
   , g_cold_account_access = 2600

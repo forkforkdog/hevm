@@ -13,7 +13,7 @@ import Data.Text (Text, pack, intercalate)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as T
 
-import EVM.ABI (AbiType(..), AbiValue(..), decodeBuf, AbiVals(..))
+import EVM.ABI (AbiType(..), AbiValue(..), decodeBuf, AbiVals(..), formatString)
 import EVM.Types (Expr(..), EType(..), FunctionSelector(..), abiKeccak, word32)
 
 -- | Try to decode and format a console.log calldata buffer.
@@ -35,11 +35,11 @@ formatConsoleLogBS bs
             _ -> "console::log(" <> hexBS bs <> ")"
         Nothing -> "console::log(" <> hexBS bs <> ")"
   where
-    hexBS b = "0x" <> T.decodeUtf8 (toStrict (toLazyByteString (byteStringHex b)))
+    hexBS b = "0x" <> T.decodeLatin1 (toStrict (toLazyByteString (byteStringHex b)))
 
 -- | Format an ABI value for console output
 showAbiVal :: AbiValue -> Text
-showAbiVal (AbiString s) = T.pack (show (Char8.unpack s))
+showAbiVal (AbiString s) = T.pack (formatString s)
 showAbiVal (AbiAddress addr) = pack (show addr)
 showAbiVal (AbiBool b) = if b then "true" else "false"
 showAbiVal v = pack (show v)

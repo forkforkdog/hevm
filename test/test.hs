@@ -8,6 +8,9 @@ module Main where
 import Prelude hiding (LT, GT)
 
 import GHC.TypeLits
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
+import Control.Exception (SomeException, try)
 import Control.Monad
 import Control.Monad.ST (stToIO)
 import Control.Monad.State.Strict
@@ -21,6 +24,7 @@ import Data.ByteString.Lazy qualified as BSLazy
 import Data.Binary.Put (runPut)
 import Data.Binary.Get (runGetOrFail)
 import Data.Either
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Maybe
@@ -40,6 +44,7 @@ import Test.Tasty.HUnit
 import Test.Tasty.Runners hiding (Failure, Success)
 import Test.Tasty.ExpectedFailure
 import Text.ParserCombinators.ReadP (readP_to_S)
+import System.Timeout (timeout)
 import Witch (unsafeInto, into)
 
 import Optics.Core hiding (pre, re, elements)
@@ -123,6 +128,53 @@ withCVC5Solver = withSolvers CVC5 3 Nothing defMemLimit
 withBitwuzlaSolver :: App m => (SolverGroup -> m a) -> m a
 withBitwuzlaSolver = withSolvers Bitwuzla 3 Nothing defMemLimit
 
+waitForTest :: String -> IO a -> IO a
+waitForTest name action = timeout 5_000_000 action >>= \case
+  Just result -> pure result
+  Nothing -> assertFailure $ name <> " timed out"
+
+-- | Fork @count@ concurrent slot fetches that all start together, optionally
+-- gating the underlying fetcher so the owner is held in-flight while waiters
+-- pile up. Returns each thread's result (or exception).
+runConcurrentSlotFetches
+  :: Fetch.Session
+  -> (Fetch.BlockNumber -> Addr -> W256 -> IO (Either Text W256))
+  -> Int -> Addr -> W256 -> Maybe (MVar (), MVar ())
+  -> IO [Either SomeException (Fetch.FetchResult W256)]
+runConcurrentSlotFetches sess fetcher count addr slot gate = do
+  start <- newEmptyMVar
+  doneVars <- replicateM count newEmptyMVar
+  forM_ doneVars $ \done -> forkIO $ do
+    readMVar start
+    result <- try $ Fetch.fetchSlotWithCacheUsing fetcher defaultConfig sess (Fetch.BlockNumber 1) (T.pack "unused") addr slot
+    putMVar done result
+  putMVar start ()
+  forM_ gate $ \(started, release) -> do
+    waitForTest "owner fetch start" (readMVar started)
+    threadDelay 100_000
+    putMVar release ()
+  waitForTest "slot fetches" (mapM readMVar doneVars)
+
+-- | Like 'runConcurrentSlotFetches' but one thread per distinct slot: distinct
+-- keys must NOT be merged, so the fetcher fires once per slot.
+runConcurrentSlotFetchesForSlots
+  :: Fetch.Session
+  -> (Fetch.BlockNumber -> Addr -> W256 -> IO (Either Text W256))
+  -> Addr -> [W256] -> MVar ()
+  -> IO [Either SomeException (Fetch.FetchResult W256)]
+runConcurrentSlotFetchesForSlots sess fetcher addr slots release = do
+  start <- newEmptyMVar
+  doneVars <- forM slots $ \slot -> do
+    done <- newEmptyMVar
+    _ <- forkIO $ do
+      readMVar start
+      result <- try $ Fetch.fetchSlotWithCacheUsing fetcher defaultConfig sess (Fetch.BlockNumber 1) (T.pack "unused") addr slot
+      putMVar done result
+    pure done
+  putMVar start ()
+  threadDelay 100_000
+  putMVar release ()
+  waitForTest "slot fetches" (mapM readMVar doneVars)
 
 main :: IO ()
 main = defaultMain tests
@@ -191,6 +243,65 @@ tests = testGroup "hevm"
 
         -- there won't be query now as accessStorage uses fetch cache
         assertBoolM (show vm4.result) (isNothing vm4.result)
+    , testCase "fetchSlotWithCache single-flights concurrent same slot" $ runEnv testEnv $ do
+        sess <- Fetch.mkSessionWithoutCache
+        counter <- liftIO $ newIORef (0 :: Int)
+        started <- liftIO newEmptyMVar
+        release <- liftIO newEmptyMVar
+        let fetcher _ _ _ = do
+              _ <- atomicModifyIORef' counter $ \n -> (n + 1, ())
+              _ <- tryPutMVar started ()
+              readMVar release
+              pure (Right 0x1234)
+        results <- liftIO $ runConcurrentSlotFetches sess fetcher 8 0x1000 0x1 (Just (started, release))
+        assertEqualM "underlying fetch count" 1 =<< liftIO (readIORef counter)
+        let successes = rights results
+        assertEqualM "all calls should succeed" 8 (length successes)
+        assertEqualM "values" (replicate 8 0x1234) [val | Fetch.FetchSuccess val _ <- successes]
+    , testCase "fetchSlotWithCache does not merge different slots" $ runEnv testEnv $ do
+        sess <- Fetch.mkSessionWithoutCache
+        counter <- liftIO $ newIORef (0 :: Int)
+        release <- liftIO newEmptyMVar
+        let slots = [0x1, 0x2, 0x3, 0x4]
+            fetcher _ _ slot = do
+              _ <- atomicModifyIORef' counter $ \n -> (n + 1, ())
+              readMVar release
+              pure (Right slot)
+        results <- liftIO $ runConcurrentSlotFetchesForSlots sess fetcher 0x1000 slots release
+        assertEqualM "underlying fetch count" (length slots) =<< liftIO (readIORef counter)
+        assertEqualM "values" slots [val | Fetch.FetchSuccess val _ <- rights results]
+    , testCase "fetchSlotWithCache owner error wakes waiters and clears in-flight entry" $ runEnv testEnv $ do
+        sess <- Fetch.mkSessionWithoutCache
+        counter <- liftIO $ newIORef (0 :: Int)
+        started <- liftIO newEmptyMVar
+        release <- liftIO newEmptyMVar
+        let fetcher _ _ _ = do
+              _ <- atomicModifyIORef' counter $ \n -> (n + 1, ())
+              _ <- tryPutMVar started ()
+              readMVar release
+              pure (Left (T.pack "boom"))
+        results <- liftIO $ runConcurrentSlotFetches sess fetcher 8 0x1000 0x2 (Just (started, release))
+        assertEqualM "all calls should complete with the same fetch error"
+          (replicate 8 (Fetch.FetchError (T.pack "boom")))
+          (rights results)
+        retry <- liftIO $ Fetch.fetchSlotWithCacheUsing fetcher defaultConfig sess (Fetch.BlockNumber 1) (T.pack "unused") 0x1000 0x2
+        assertEqualM "retry should fetch again" (Fetch.FetchError (T.pack "boom")) retry
+        assertEqualM "underlying fetch count after retry" 2 =<< liftIO (readIORef counter)
+    , testCase "fetchSlotWithCache owner exception wakes waiters and clears in-flight entry" $ runEnv testEnv $ do
+        sess <- Fetch.mkSessionWithoutCache
+        counter <- liftIO $ newIORef (0 :: Int)
+        started <- liftIO newEmptyMVar
+        release <- liftIO newEmptyMVar
+        let fetcher _ _ _ = do
+              _ <- atomicModifyIORef' counter $ \n -> (n + 1, ())
+              _ <- tryPutMVar started ()
+              readMVar release
+              ioError (userError "boom")
+        results <- liftIO $ runConcurrentSlotFetches sess fetcher 8 0x1000 0x3 (Just (started, release))
+        assertEqualM "all calls should complete with exceptions" 8 (length (lefts results))
+        retry <- liftIO $ try $ Fetch.fetchSlotWithCacheUsing fetcher defaultConfig sess (Fetch.BlockNumber 1) (T.pack "unused") 0x1000 0x3
+        assertBoolM "retry should throw again" (isLeft (retry :: Either SomeException (Fetch.FetchResult W256)))
+        assertEqualM "underlying fetch count after retry" 2 =<< liftIO (readIORef counter)
     ]
   , testGroup "ABI"
     [ testProperty "Put/get inverse" $ \x ->
@@ -603,6 +714,17 @@ tests = testGroup "hevm"
               assertEqualM "fail because bit flip"
                 Nothing
                 (execute 1 (h <> v <> r <> s) 32)
+          ]
+
+      , testGroup "P256VERIFY"
+          [ test "official valid vector" $ do
+              let input = hex "bb5a52f42f9c9261ed4361f59422a1e30036e7c32b270c8807a419feca6050232ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e184cd60b855d442f5b3c7b11eb6c4e0ae7525fe710fab9aa7c77a67f79e6fadd762927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e"
+              assertBoolM "valid EIP-7951 vector verifies" (p256VerifyInput input)
+          , test "official invalid signature vector" $ do
+              let input = hex "bb5a52f42f9c9261ed4361f59422a1e30036e7c32b270c8807a419feca605023d45c5740946b2a147f59262ee6f5bc90bd01ed280528b62b3aed5fc93f06f739b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db2927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e"
+              assertBoolM "invalid EIP-7951 vector is rejected" (not $ p256VerifyInput input)
+          , test "malformed length returns false" $ do
+              assertBoolM "short input is rejected" (not $ p256VerifyInput "short")
           ]
       ]
   , testGroup "Byte/word manipulations"

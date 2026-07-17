@@ -182,7 +182,7 @@ formatBString b = mconcat [ "«",  T.dropAround (=='"') (pack $ formatString b),
 
 formatBinary :: ByteString -> Text
 formatBinary =
-  (<>) "0x" . T.decodeUtf8 . toStrict . toLazyByteString . byteStringHex
+  (<>) "0x" . T.decodeLatin1 . toStrict . toLazyByteString . byteStringHex
 
 formatSBinary :: Expr Buf -> Text
 formatSBinary e = format $ Expr.concKeccakSimpExpr e

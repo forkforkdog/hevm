@@ -614,6 +614,7 @@ data Query t where
   PleaseGetSols       :: Expr EWord -> Int -> [Prop] -> (Maybe [W256] -> EVM Symbolic ()) -> Query Symbolic
   PleaseDoFFI         :: [String] -> Map String String -> (ByteString -> EVM t ()) -> Query t
   PleaseReadEnv       :: String -> (String -> EVM t ()) -> Query t
+  PleaseGetCode       :: FilePath -> (Either String ByteString -> EVM t ()) -> Query t
 
 data BranchContext where
   PleaseRunBoth :: (Bool -> EVM Symbolic ()) -> BranchContext
@@ -645,6 +646,8 @@ instance Show (Query t) where
       (("<EVM.Query: do ffi: " ++ (show cmd) ++ " env: " ++ (show env)) ++)
     PleaseReadEnv variable _ ->
       (("<EVM.Query: read env: " ++ variable) ++)
+    PleaseGetCode path _ ->
+      (("<EVM.Query: get code: " ++ path ++ ">") ++)
 
 instance Show (BranchContext) where
   showsPrec _ = \case
@@ -771,6 +774,7 @@ runSrcLookup (Just (SrcLookup f)) contracts addr pc = f contracts addr pc
 data RuntimeConfig = RuntimeConfig
   { allowFFI :: Bool
   , baseState :: BaseState
+  , traceEnabled :: Bool
   }
   deriving (Show)
 
@@ -861,6 +865,9 @@ data TxState = TxState
   , isCreate    :: Bool
   , txReversion :: Map (Expr EAddr) Contract
   , txdataFloorGas :: Word64
+  , recordingStorageAccesses :: Bool
+  , recordedStorageReads     :: [(Expr EAddr, W256)]
+  , recordedStorageWrites    :: [(Expr EAddr, W256)]
   }
   deriving (Show)
 
@@ -1285,7 +1292,7 @@ instance Show ByteStringS where
   show (ByteStringS x) = ("0x" ++) . T.unpack . fromBinary $ x
     where
       fromBinary =
-        T.decodeUtf8 . toStrict . toLazyByteString . byteStringHex
+        T.decodeLatin1 . toStrict . toLazyByteString . byteStringHex
 
 instance JSON.FromJSON ByteStringS where
   parseJSON (JSON.String x) =
@@ -1629,9 +1636,17 @@ padRight' n xs = xs <> replicate (n - length xs) '0'
 -- We need this here instead of Format for cyclic import reasons...
 formatString :: ByteString -> String
 formatString bs =
-  case T.decodeUtf8' (fst (BS.spanEnd (== 0) bs)) of
+  let stripped = fst (BS.spanEnd (== 0) bs)
+  in case T.decodeUtf8' stripped of
     Right s -> "\"" <> T.unpack s <> "\""
-    Left _ -> "❮utf8 decode failed❯: " <> (show $ ByteStringS bs)
+    Left _ -> "\"" <> concatMap escapeByte (BS.unpack stripped) <> "\""
+
+escapeByte :: Word8 -> String
+escapeByte w
+  | w == 0x22 = "\\\""
+  | w == 0x5c = "\\\\"
+  | w >= 0x20 && w <= 0x7e = [chr (fromIntegral w)]
+  | otherwise = "\\x" <> paddedShowHex 2 w
 
 -- |'paddedShowHex' displays a number in hexadecimal and pads the number
 -- with 0 so that it has a minimum length of @w@.
